@@ -246,8 +246,19 @@ upload_dsyms() {
   sentry-cli debug-files upload --include-sources "$DSYM" || echo "!! sentry-cli upload failed (continuing)"
 }
 
+sign_runtime_binaries() {
+  # every Mach-O in the bundled Python/ffmpeg runtime gets its own signature, so the
+  # app's seal is complete and nothing inside it reads as tampered on another Mac
+  local id="$1" n=0
+  while IFS= read -r f; do
+    codesign --force --sign "$id" "$f" 2>/dev/null && n=$((n+1))
+  done < <(find "$APP/Contents/Resources/autoedit-runtime" -type f \( -perm -u+x -o -name '*.so' -o -name '*.dylib' \) -exec file {} + | grep 'Mach-O' | cut -d: -f1)
+  echo "==> Signed $n runtime binaries"
+}
+
 if [ "$MODE" = "dev" ]; then
   echo "==> Ad-hoc signing dev app"
+  [ -d "$APP/Contents/Resources/autoedit-runtime" ] && sign_runtime_binaries -
   codesign --force --deep --sign - "$APP"
   codesign --verify --strict --verbose=2 "$APP"
   upload_dsyms

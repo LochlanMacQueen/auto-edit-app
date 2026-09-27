@@ -16,6 +16,6 @@ for b in ffmpeg ffprobe; do
   [ -x "$V/$b" ] || { curl -sL -o "$V/$b.zip" "https://ffmpeg.martin-riedl.de/redirect/latest/macos/arm64/release/$b.zip" && (cd "$V" && unzip -qo "$b.zip") && chmod +x "$V/$b"; }
 done
 rm -rf "$R/python"; cp -R "$V/python" "$R/python"; cp "$V/ffmpeg" "$V/ffprobe" "$R/bin/"
-rsync -a --delete --exclude __pycache__ --exclude .wda_session --exclude .palmier_session "$SERVER_REPO/autoedit" "$SERVER_REPO/ugc" "$SERVER_REPO/mcpb-autoedit" "$SERVER_REPO/tests" "$SERVER_REPO/requirements-autoedit.txt" "$R/app/"
+rsync -a --delete --exclude __pycache__ --exclude .wda_session --exclude .palmier_session --exclude 'runs/*' --exclude .DS_Store "$SERVER_REPO/autoedit" "$SERVER_REPO/ugc" "$SERVER_REPO/mcpb-autoedit" "$SERVER_REPO/tests" "$SERVER_REPO/requirements-autoedit.txt" "$R/app/"
 find "$R" -name __pycache__ -type d -prune -exec rm -rf {} +
 echo "runtime staged at $R ($(du -sh "$R" | cut -f1))"

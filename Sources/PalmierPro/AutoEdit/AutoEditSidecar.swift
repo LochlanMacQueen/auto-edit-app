@@ -73,6 +73,10 @@ final class AutoEditSidecar {
         guard let p = process, p.isRunning else { return }
         p.terminate()
         process = nil
+        let pid = p.processIdentifier
+        DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 3) {
+            if p.isRunning { kill(pid, SIGKILL) }       // never leave the server running after quit
+        }
     }
 
     nonisolated static func isUp() async -> Bool {
