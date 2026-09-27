@@ -21,7 +21,7 @@ enum MainMenuBuilder {
     private static func appMenu() -> NSMenuItem {
         let item = NSMenuItem()
         let menu = NSMenu(title: AppIdentity.name)
-        menu.addItem(withTitle: L10n.string("About Palmier Pro"), action: #selector(NSApplication.orderFrontStandardAboutPanel(_:)), keyEquivalent: "")
+        menu.addItem(withTitle: "About \(AppIdentity.name)", action: #selector(NSApplication.orderFrontStandardAboutPanel(_:)), keyEquivalent: "")
         menu.addItem(.separator())
         let updatesItem = NSMenuItem(title: L10n.string("Check for Updates…"), action: #selector(Updater.checkForUpdates(_:)), keyEquivalent: "")
         updatesItem.target = Updater.shared
@@ -29,7 +29,7 @@ enum MainMenuBuilder {
         menu.addItem(.separator())
         menu.addItem(withTitle: L10n.string("Settings…"), action: #selector(AppDelegate.showSettings(_:)), keyEquivalent: ",")
         menu.addItem(.separator())
-        menu.addItem(withTitle: L10n.string("Quit Palmier Pro"), action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
+        menu.addItem(withTitle: "Quit \(AppIdentity.name)", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
         item.submenu = menu
         return item
     }
@@ -178,12 +178,15 @@ enum MainMenuBuilder {
     private static func autoEditMenu() -> NSMenuItem {
         let item = NSMenuItem()
         let menu = NSMenu(title: "auto-edit")
+        menu.addItem(withTitle: "Make a Video", action: #selector(AppDelegate.showAutoEditMake(_:)), keyEquivalent: "m").keyEquivalentModifierMask = [.command, .shift]
         menu.addItem(withTitle: "Review", action: #selector(AppDelegate.showAutoEditReview(_:)), keyEquivalent: "r").keyEquivalentModifierMask = [.command, .shift]
         menu.addItem(withTitle: "Posting Queue", action: #selector(AppDelegate.showAutoEditQueue(_:)), keyEquivalent: "")
         menu.addItem(withTitle: "Phone", action: #selector(AppDelegate.showAutoEditPhone(_:)), keyEquivalent: "")
         menu.addItem(.separator())
-        menu.addItem(withTitle: "Setup", action: #selector(AppDelegate.showAutoEditSetup(_:)), keyEquivalent: "")
+        menu.addItem(withTitle: "Get Started (Setup)", action: #selector(AppDelegate.showAutoEditStart(_:)), keyEquivalent: "")
         menu.addItem(withTitle: "Connect Claude / ChatGPT…", action: #selector(AppDelegate.showAutoEditConnect(_:)), keyEquivalent: "")
+        menu.addItem(.separator())
+        menu.addItem(withTitle: "Show / Hide Video Editor (advanced)", action: #selector(AppDelegate.toggleVideoEditor(_:)), keyEquivalent: "")
         item.submenu = menu
         return item
     }

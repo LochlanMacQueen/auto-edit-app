@@ -71,6 +71,10 @@ final class AppState {
     }
 
     func showHome() {
+        if AutoEditMode.editorHidden {                 // headless: the auto-edit window is "home"
+            AutoEditWindowController.shared.show(section: "start")
+            return
+        }
         guard let project = activeProject else {
             HomeWindowController.shared.showWindow(nil)
             return
@@ -98,6 +102,7 @@ final class AppState {
 
     func showEditor(for project: VideoProject) {
         activateProject(project)
+        guard !AutoEditMode.editorHidden else { return }   // headless: keep the editor off screen
         project.showWindows()
         hideHomeIfEditorIsVisible(for: project)
     }
@@ -130,7 +135,7 @@ final class AppState {
             activeProject = nil
             if let next = openProjects.first {
                 showEditor(for: next)
-            } else {
+            } else if !AutoEditMode.editorHidden {
                 HomeWindowController.shared.showWindow(nil)
             }
         }

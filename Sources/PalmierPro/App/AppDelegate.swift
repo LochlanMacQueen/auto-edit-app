@@ -20,7 +20,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // Start Sparkle updater
         _ = Updater.shared
 
-        HomeWindowController.shared.showWindow(nil)
+        if !AutoEditMode.editorHidden {
+            HomeWindowController.shared.showWindow(nil)
+        }
         SkillStore.shared.startSkillSync()
         Task.detached(priority: .utility) {
             Project.ensureStorageDirectory()
@@ -30,11 +32,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         AppState.shared.startMCPService()
         AutoEditSidecar.shared.start()
-        Task { @MainActor in
-            try? await Task.sleep(for: .seconds(1))
-            AutoEditWindowController.shared.show(section: UserDefaults.standard.bool(forKey: "autoedit.setupSeen") ? "review" : "setup")
-            UserDefaults.standard.set(true, forKey: "autoedit.setupSeen")
-        }
+        AutoEditWindowController.shared.show(section: UserDefaults.standard.bool(forKey: "autoedit.setupSeen") ? "make" : "start")
+        UserDefaults.standard.set(true, forKey: "autoedit.setupSeen")
 
         // Pre-warm NSOpenPanel to avoid main thread blocking during cold start.
         Task { @MainActor [weak self] in
@@ -50,7 +49,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
         if !flag {
-            AppState.shared.showHome()
+            AutoEditWindowController.shared.show(section: "make")
         }
         return true
     }
@@ -89,7 +88,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         return .terminateLater
     }
 
-    @objc func showAutoEditSetup(_ sender: Any?) { AutoEditWindowController.shared.show(section: "setup") }
+    @objc func showAutoEditStart(_ sender: Any?) { AutoEditWindowController.shared.show(section: "start") }
+    @objc func showAutoEditMake(_ sender: Any?) { AutoEditWindowController.shared.show(section: "make") }
+    @objc func toggleVideoEditor(_ sender: Any?) { AutoEditMode.editorHidden ? AutoEditMode.revealEditor() : AutoEditMode.hideEditor() }
     @objc func showAutoEditReview(_ sender: Any?) { AutoEditWindowController.shared.show(section: "review") }
     @objc func showAutoEditQueue(_ sender: Any?) { AutoEditWindowController.shared.show(section: "queue") }
     @objc func showAutoEditPhone(_ sender: Any?) { AutoEditWindowController.shared.show(section: "phone") }
