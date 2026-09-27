@@ -143,6 +143,8 @@ fi
 
 # Flatten SwiftPM's resource bundle into the app's Resources tree.
 RES_BUNDLE="$(dirname "$BIN")/PalmierPro_PalmierPro.bundle"
+# Newer SwiftPM (Xcode 27) lays the resource bundle out as a macOS bundle.
+[ -d "$RES_BUNDLE/Contents/Resources" ] && RES_BUNDLE="$RES_BUNDLE/Contents/Resources"
 if [ -d "$RES_BUNDLE/Fonts" ]; then
   cp -R "$RES_BUNDLE/Fonts" "$APP/Contents/Resources/"
 else
