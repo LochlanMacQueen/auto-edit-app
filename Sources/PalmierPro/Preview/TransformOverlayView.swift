@@ -1,0 +1,392 @@
+import SwiftUI
+
+struct TransformOverlayView: View {
+    @Environment(EditorViewModel.self) var editor
+
+    private let handleSize: CGFloat = AppTheme.Spacing.smMd
+    private let borderColor = AppTheme.MediaOverlay.primaryColor.opacity(AppTheme.Opacity.strong)
+
+    var body: some View {
+        GeometryReader { geo in
+            let videoRect = videoContentRect(in: geo.size)
+
+            if let clip = selectedClip {
+                let xform = clip.transformAt(frame: editor.activeFrame)
+                let clipRect = clipFrame(xform, videoRect: videoRect)
+
+                if clip.mediaType == .text && xform.hasTiltRotation {
+                    tiltOverlay(clip: clip, transform: xform, clipRect: clipRect, videoRect: videoRect)
+                } else {
+                    boxOverlay(clip: clip, clipRect: clipRect, rotation: xform.rotation, videoRect: videoRect)
+                }
+            }
+
+            if selectedClip != nil && (centerGuideX || editor.rotationSnapGuidesVisible) {
+                Rectangle()
+                    .fill(centerGuideColor)
+                    .frame(width: 1, height: videoRect.height)
+                    .position(x: videoRect.midX, y: videoRect.midY)
+                    .allowsHitTesting(false)
+            }
+            if selectedClip != nil && (centerGuideY || editor.rotationSnapGuidesVisible) {
+                Rectangle()
+                    .fill(centerGuideColor)
+                    .frame(width: videoRect.width, height: 1)
+                    .position(x: videoRect.midX, y: videoRect.midY)
+                    .allowsHitTesting(false)
+            }
+        }
+        .allowsHitTesting(selectedClip != nil)
+    }
+
+    @ViewBuilder
+    private func boxOverlay(
+        clip: Clip,
+        clipRect: CGRect,
+        rotation: Double,
+        videoRect: CGRect
+    ) -> some View {
+        let hit = rotatedHitTarget(clipRect.size, degrees: rotation)
+        Rectangle()
+            .fill(AppTheme.MediaOverlay.primaryColor.opacity(AppTheme.Opacity.hitTarget))
+            .frame(width: hit.frame.width, height: hit.frame.height)
+            .contentShape(hit.shape)
+            .position(x: clipRect.midX, y: clipRect.midY)
+            .gesture(moveGesture(clip: clip, videoRect: videoRect))
+
+        ZStack {
+            Rectangle()
+                .stroke(borderColor, lineWidth: AppTheme.BorderWidth.thin)
+            ForEach(Corner.allCases, id: \.self) { corner in
+                let off = cornerOffset(corner, halfW: clipRect.width / 2, halfH: clipRect.height / 2)
+                Rectangle()
+                    .fill(borderColor)
+                    .frame(width: handleSize, height: handleSize)
+                    .offset(x: off.x, y: off.y)
+                    .pointerStyle(.frameResize(position: corner.resizePosition))
+                    .gesture(resizeGesture(clip: clip, corner: corner, videoRect: videoRect))
+            }
+        }
+        .frame(width: clipRect.width, height: clipRect.height)
+        .rotationEffect(.degrees(rotation))
+        .position(x: clipRect.midX, y: clipRect.midY)
+    }
+
+    private func tiltOverlay(
+        clip: Clip,
+        transform: Transform,
+        clipRect: CGRect,
+        videoRect: CGRect
+    ) -> some View {
+        let corners = TextTiltGeometry.corners(
+            of: clipRect,
+            around: CGPoint(x: clipRect.midX, y: clipRect.midY),
+            transform: transform,
+            canvasSize: videoRect.size
+        )
+        let outline = Path { path in
+            path.addLines(corners.points)
+            path.closeSubpath()
+        }
+        return ZStack {
+            outline
+                .fill(AppTheme.MediaOverlay.primaryColor.opacity(AppTheme.Opacity.hitTarget))
+                .contentShape(outline)
+                .gesture(moveGesture(clip: clip, videoRect: videoRect))
+            outline.stroke(borderColor, lineWidth: AppTheme.BorderWidth.thin)
+            ForEach(Corner.allCases, id: \.self) { corner in
+                Rectangle()
+                    .fill(borderColor)
+                    .frame(width: handleSize, height: handleSize)
+                    .position(corner.point(in: corners))
+                    .pointerStyle(.frameResize(position: corner.resizePosition))
+                    .gesture(resizeGesture(clip: clip, corner: corner, videoRect: videoRect))
+            }
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+
+    // MARK: - Gestures
+
+    @State private var dragStart: Transform?
+    @State private var resizeStart: Transform?
+    @State private var resizeStartFontScale: Double?
+    @State private var centerGuideX: Bool = false
+    @State private var centerGuideY: Bool = false
+
+    private let centerGuideColor = AppTheme.Accent.timecodeColor.opacity(AppTheme.Opacity.prominent)
+
+    private func moveGesture(clip: Clip, videoRect: CGRect) -> some Gesture {
+        DragGesture()
+            .onChanged { value in
+                if dragStart == nil { dragStart = clip.transformAt(frame: editor.activeFrame) }
+                guard let start = dragStart else { return }
+                let (moved, snap) = TransformOverlayMath.movedTransform(start, by: value.translation, in: videoRect)
+                if centerGuideX != snap.x { centerGuideX = snap.x }
+                if centerGuideY != snap.y { centerGuideY = snap.y }
+                editor.applyTransform(clipId: clip.id, newTransform: moved)
+            }
+            .onEnded { value in
+                guard let start = dragStart else { return }
+                let (moved, _) = TransformOverlayMath.movedTransform(start, by: value.translation, in: videoRect)
+                dragStart = nil
+                if centerGuideX { centerGuideX = false }
+                if centerGuideY { centerGuideY = false }
+                editor.commitTransform(clipId: clip.id, newTransform: moved, actionName: "Change Position")
+            }
+    }
+
+    private func resizeGesture(clip: Clip, corner: Corner, videoRect: CGRect) -> some Gesture {
+        DragGesture()
+            .onChanged { value in
+                if resizeStart == nil {
+                    resizeStart = clip.transformAt(frame: editor.activeFrame)
+                    resizeStartFontScale = clip.mediaType == .text
+                        ? clip.textScaleAt(frame: editor.activeFrame)
+                        : nil
+                }
+                guard let start = resizeStart else { return }
+
+                if let startScale = resizeStartFontScale {
+                    let newScale = textScale(from: value.translation, corner: corner, start: start, startScale: startScale, videoRect: videoRect)
+                    if clip.scaleTrack?.isActive == true {
+                        editor.applyScale(clipId: clip.id, newScale: newScale)
+                    } else {
+                        editor.applyTextStyle(clipId: clip.id, fitToContent: true) { $0.fontScale = newScale }
+                    }
+                } else {
+                    let resized = resizedTransform(start, corner: corner, by: value.translation, in: videoRect, mediaCanvasAspect: mediaCanvasAspect, rotated: start.rotation != 0)
+                    editor.applyTransform(clipId: clip.id, newTransform: resized)
+                }
+            }
+            .onEnded { value in
+                guard let start = resizeStart else { return }
+                let startScale = resizeStartFontScale
+                resizeStart = nil
+                resizeStartFontScale = nil
+
+                if let startScale {
+                    let newScale = textScale(from: value.translation, corner: corner, start: start, startScale: startScale, videoRect: videoRect)
+                    if clip.scaleTrack?.isActive == true {
+                        editor.commitScale(clipId: clip.id, newScale: newScale)
+                    } else {
+                        editor.commitTextStyle(clipId: clip.id, fitToContent: true) { $0.fontScale = newScale }
+                    }
+                } else {
+                    let resized = resizedTransform(start, corner: corner, by: value.translation, in: videoRect, mediaCanvasAspect: mediaCanvasAspect, rotated: start.rotation != 0)
+                    editor.commitTransform(clipId: clip.id, newTransform: resized, actionName: "Change Scale")
+                }
+            }
+    }
+
+    private func textScale(from translation: CGSize, corner: Corner, start: Transform, startScale: Double, videoRect: CGRect) -> Double {
+        guard videoRect.width > 0, videoRect.height > 0, start.width > 0, start.height > 0 else { return startScale }
+        let dx = translation.width / videoRect.width
+        let dy = translation.height / videoRect.height
+        let wSign: Double = (corner == .topLeft || corner == .bottomLeft) ? -1 : 1
+        let hSign: Double = (corner == .topLeft || corner == .topRight) ? -1 : 1
+        let wRatio = max(0.01, (start.width + wSign * dx) / start.width)
+        let hRatio = max(0.01, (start.height + hSign * dy) / start.height)
+        return max(0.05, startScale * sqrt(wRatio * hRatio))
+    }
+
+    private func resizedTransform(_ start: Transform, corner: Corner, by translation: CGSize, in videoRect: CGRect, mediaCanvasAspect: Double?, rotated: Bool) -> Transform {
+        guard videoRect.width > 0, videoRect.height > 0 else {
+            Log.preview.warning("resizedTransform: collapsed videoRect \(videoRect.debugDescription) — skipping")
+            return start
+        }
+        let minSize = 0.05
+        let dx = translation.width / videoRect.width
+        let dy = translation.height / videoRect.height
+        let tl = start.topLeft
+        var left = tl.x, top = tl.y
+        var right = left + start.width, bottom = top + start.height
+
+        switch corner {
+        case .topLeft:     left += dx; top += dy
+        case .topRight:    right += dx; top += dy
+        case .bottomLeft:  left += dx; bottom += dy
+        case .bottomRight: right += dx; bottom += dy
+        }
+
+        // Stop the dragged edge at the opposite edge so the rect can never invert
+        switch corner {
+        case .topLeft:
+            left = min(left, right - minSize)
+            top = min(top, bottom - minSize)
+        case .topRight:
+            right = max(right, left + minSize)
+            top = min(top, bottom - minSize)
+        case .bottomLeft:
+            left = min(left, right - minSize)
+            bottom = max(bottom, top + minSize)
+        case .bottomRight:
+            right = max(right, left + minSize)
+            bottom = max(bottom, top + minSize)
+        }
+
+        if let aspect = mediaCanvasAspect {
+            let w = right - left
+            let h = bottom - top
+            let widthFromHeight = h * aspect
+
+            if w >= widthFromHeight {
+                let adjustedH = w / aspect
+                switch corner {
+                case .topLeft, .topRight: top = bottom - adjustedH
+                case .bottomLeft, .bottomRight: bottom = top + adjustedH
+                }
+            } else {
+                let adjustedW = h * aspect
+                switch corner {
+                case .topLeft, .bottomLeft: left = right - adjustedW
+                case .topRight, .bottomRight: right = left + adjustedW
+                }
+            }
+        }
+
+        // Canvas-edge snap operates on axis-aligned coordinates, so it only makes sense
+        // when the clip itself is axis-aligned; skip it under rotation.
+        if !rotated {
+            let snapH = Snap.thresholdPixels / Double(videoRect.width)
+            let snapV = Snap.thresholdPixels / Double(videoRect.height)
+            let movesLeft = corner == .topLeft || corner == .bottomLeft
+            let movesTop = corner == .topLeft || corner == .topRight
+
+            let snappedH = Transform.snapToBoundary(movesLeft ? left : right, threshold: snapH)
+            let snappedV = Transform.snapToBoundary(movesTop ? top : bottom, threshold: snapV)
+
+            if snappedH != (movesLeft ? left : right) {
+                if movesLeft { left = snappedH } else { right = snappedH }
+                if let aspect = mediaCanvasAspect {
+                    if movesTop { top = bottom - (right - left) / aspect } else { bottom = top + (right - left) / aspect }
+                }
+            } else if snappedV != (movesTop ? top : bottom) {
+                if movesTop { top = snappedV } else { bottom = snappedV }
+                if let aspect = mediaCanvasAspect {
+                    if movesLeft { left = right - (bottom - top) * aspect } else { right = left + (bottom - top) * aspect }
+                }
+            }
+        }
+
+        var out = Transform(
+            topLeft: (left, top),
+            width: max(0.05, right - left),
+            height: max(0.05, bottom - top)
+        )
+        out.rotation = start.rotation
+        return out
+    }
+
+    // MARK: - Layout
+
+    private func videoContentRect(in viewSize: CGSize) -> CGRect {
+        let videoAspect = CGFloat(editor.timeline.width) / CGFloat(editor.timeline.height)
+        let viewAspect = viewSize.width / viewSize.height
+        let w: CGFloat, h: CGFloat
+        if viewAspect > videoAspect {
+            h = viewSize.height; w = h * videoAspect
+        } else {
+            w = viewSize.width; h = w / videoAspect
+        }
+        return CGRect(x: (viewSize.width - w) / 2, y: (viewSize.height - h) / 2, width: w, height: h)
+    }
+
+    private func clipFrame(_ t: Transform, videoRect: CGRect) -> CGRect {
+        let tl = t.topLeft
+        return CGRect(
+            x: videoRect.origin.x + tl.x * videoRect.width,
+            y: videoRect.origin.y + tl.y * videoRect.height,
+            width: t.width * videoRect.width,
+            height: t.height * videoRect.height
+        )
+    }
+
+    private func cornerOffset(_ corner: Corner, halfW: CGFloat, halfH: CGFloat) -> CGPoint {
+        switch corner {
+        case .topLeft:     CGPoint(x: -halfW, y: -halfH)
+        case .topRight:    CGPoint(x:  halfW, y: -halfH)
+        case .bottomLeft:  CGPoint(x: -halfW, y:  halfH)
+        case .bottomRight: CGPoint(x:  halfW, y:  halfH)
+        }
+    }
+
+    private func rotatedHitTarget(_ size: CGSize, degrees: Double) -> (frame: CGSize, shape: Path) {
+        let rad = degrees * .pi / 180
+        let absC = abs(cos(rad)), absS = abs(sin(rad))
+        let frame = CGSize(
+            width:  size.width * absC + size.height * absS,
+            height: size.width * absS + size.height * absC
+        )
+        let transform = CGAffineTransform(translationX: -size.width / 2, y: -size.height / 2)
+            .concatenating(CGAffineTransform(rotationAngle: rad))
+            .concatenating(CGAffineTransform(translationX: frame.width / 2, y: frame.height / 2))
+        return (frame, Path(CGRect(origin: .zero, size: size)).applying(transform))
+    }
+
+    private var mediaCanvasAspect: Double? {
+        guard let clip = selectedClip else { return nil }
+        return editor.mediaCanvasAspect(for: clip)
+    }
+
+    // MARK: - Selection
+
+    private var selectedClip: Clip? {
+        guard editor.activePreviewTab == .timeline,
+              !editor.selectedClipIds.isEmpty else { return nil }
+        for track in editor.timeline.tracks where track.type != .audio {
+            for clip in track.clips where editor.selectedClipIds.contains(clip.id) {
+                return clip
+            }
+        }
+        return nil
+    }
+
+    private enum Corner: CaseIterable {
+        case topLeft, topRight, bottomLeft, bottomRight
+
+        var resizePosition: FrameResizePosition {
+            switch self {
+            case .topLeft: .topLeading
+            case .topRight: .topTrailing
+            case .bottomLeft: .bottomLeading
+            case .bottomRight: .bottomTrailing
+            }
+        }
+
+        func point(in corners: TextTiltCorners) -> CGPoint {
+            switch self {
+            case .topLeft: corners.topLeft
+            case .topRight: corners.topRight
+            case .bottomLeft: corners.bottomLeft
+            case .bottomRight: corners.bottomRight
+            }
+        }
+    }
+}
+
+enum TransformOverlayMath {
+    static func movedTransform(
+        _ start: Transform,
+        by translation: CGSize,
+        in videoRect: CGRect
+    ) -> (transform: Transform, guides: (x: Bool, y: Bool)) {
+        guard videoRect.width > 0, videoRect.height > 0 else {
+            Log.preview.warning("movedTransform: collapsed videoRect \(videoRect.debugDescription) — skipping")
+            return (start, (false, false))
+        }
+
+        var moved = start
+        moved.centerX += translation.width / videoRect.width
+        moved.centerY += translation.height / videoRect.height
+
+        if start.rotation == 0 && !start.hasTiltRotation {
+            moved.snapToCanvasEdges(threshold: Snap.thresholdPixels / Double(videoRect.width))
+        }
+        let guides = moved.snapCenterToCanvasCenter(
+            thresholdH: Snap.thresholdPixels / Double(videoRect.width),
+            thresholdV: Snap.thresholdPixels / Double(videoRect.height)
+        )
+        return (moved, guides)
+    }
+}

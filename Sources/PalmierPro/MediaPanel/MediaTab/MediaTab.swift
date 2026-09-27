@@ -1,0 +1,833 @@
+import SwiftUI
+import UniformTypeIdentifiers
+
+struct MediaTab: View {
+    @Environment(EditorViewModel.self) var editor
+
+    // Toolbar state
+    @State var sortMode: SortMode = .dateAdded
+    @State var filterTypes: Set<ClipType> = []
+    @State var filterAI = false
+    @State var searchQuery: String = ""
+    @State var thumbnailSize: Double = 80
+    @State var viewMode: ViewMode = .folder
+    @FocusState private var isSearchFocused: Bool
+
+    // Navigation + selection state
+    @State var currentFolderId: String? = nil
+    @State var folderReturnViewMode: ViewMode?
+    @State var renamingFolderId: String?
+    @State var renamingTimelineId: String?
+    @State var dropTargetFolderId: String?
+    /// Hovered grouped-section key; "" = root.
+    @State var dropTargetGroupedKey: String?
+    /// Collapsed grouped-section keys; "" = root.
+    @State var collapsedGroupedKeys: Set<String> = []
+
+    // Drop + marquee
+    @State var isDropTargeted = false
+    @State var visualHits: [VisualSearch.Hit] = []
+    @State var spokenHits: [TranscriptSearch.Hit] = []
+    @State var collapsedSearchSections: Set<String> = []
+    @State var momentSearchTask: Task<Void, Never>?
+    @State var assetFrames: [String: CGRect] = [:]
+    @State var marqueeSelection = MarqueeSelection()
+
+    @State private var mediaPanelHeight: CGFloat = 600
+    @State private var showMatteSheet = false
+
+    enum ViewMode: String, CaseIterable {
+        case folder, flat, grouped
+
+        var title: String {
+            switch self {
+            case .folder: L10n.key("Folders")
+            case .flat: L10n.key("Flat")
+            case .grouped: L10n.key("Grouped")
+            }
+        }
+
+        var systemImage: String {
+            switch self {
+            case .folder: "folder"
+            case .flat: "square.grid.2x2"
+            case .grouped: "rectangle.split.1x2"
+            }
+        }
+    }
+
+    /// Only media types that can actually appear in the panel. ClipType.text
+    /// exists for timeline clips but is never assigned to a MediaAsset.
+    private static let filterableTypes: [ClipType] = [.video, .audio, .image, .subtitle]
+
+    private enum ThumbnailPreset: String, CaseIterable, Identifiable {
+        case small, medium, large, xlarge
+        var id: String { rawValue }
+        var title: String {
+            switch self {
+            case .small: L10n.key("Small")
+            case .medium: L10n.key("Medium")
+            case .large: L10n.key("Large")
+            case .xlarge: L10n.key("Extra Large")
+            }
+        }
+        var size: Double {
+            switch self {
+            case .small: 80
+            case .medium: 110
+            case .large: 150
+            case .xlarge: 200
+            }
+        }
+    }
+
+    // MARK: - Body
+
+    var body: some View {
+        VStack(spacing: 0) {
+            toolbar
+
+            if editor.pendingSwapClipId != nil {
+                swapBanner
+            }
+
+            VStack(spacing: 0) {
+                MediaPanelDropArea(
+                    isTargeted: $isDropTargeted,
+                    onDrop: { urls in handlePanelFinderDrop(urls: urls) }
+                ) {
+                    VStack(spacing: 0) {
+                        if showsEmptyState {
+                            emptyStateView
+                                .onAppear {
+                                    publishGridState(orderedIds: [], columnCount: 1)
+                                    editor.clearMediaPanelSelection()
+                                }
+                        } else if !trimmedSearchQuery.isEmpty {
+                            searchResults
+                        } else {
+                            switch viewMode {
+                            case .folder: mediaGridView
+                            case .flat: flatGridView
+                            case .grouped: groupedGridView
+                            }
+                        }
+                    }
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    .contentShape(Rectangle())
+                    .contextMenu { mediaBrowserContextMenu }
+                }
+                .overlay {
+                    if isDropTargeted { dropHighlight.allowsHitTesting(false) }
+                }
+                .overlay(alignment: .bottom) {
+                    if let toast = editor.mediaPanelToast {
+                        toastBanner(toast)
+                            .transition(.move(edge: .bottom).combined(with: .opacity))
+                    }
+                }
+                .animation(.easeInOut(duration: AppTheme.Anim.transition), value: editor.mediaPanelToast)
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .layoutPriority(1)
+
+                if editor.showGenerationPanel && !mediaAreaCollapsed {
+                    GenerationView(maxPanelHeight: generationPanelMaxHeight)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .tourAnchor(.generation)
+                        .transition(.move(edge: .bottom).combined(with: .opacity))
+                }
+            }
+            .layoutPriority(1)
+            .onChange(of: searchQuery) { _, _ in scheduleMomentSearch() }
+        }
+        .onGeometryChange(for: CGFloat.self) { proxy in
+            proxy.size.height
+        } action: { newValue in
+            mediaPanelHeight = newValue
+        }
+        .onExitCommand { if editor.pendingSwapClipId != nil { editor.cancelMediaSwap() } }
+        .onChange(of: editor.folders.map(\.id)) { _, _ in pruneStaleFolderState() }
+        .onChange(of: editor.mediaPanelRevealAssetId) { _, target in
+            guard let target else { return }
+            revealAsset(id: target)
+            editor.mediaPanelRevealAssetId = nil
+        }
+        .onChange(of: editor.mediaPanelOpenFolderId) { _, target in
+            guard let target else { return }
+            openFolder(id: target)
+            editor.mediaPanelOpenFolderId = nil
+        }
+        .onChange(of: editor.mediaPanelNavigateUpRequestTick) { _, _ in
+            navigateUp()
+        }
+        .onChange(of: editor.mediaPanelNewFolderRequestTick) { _, _ in
+            createNewFolderInCurrent()
+        }
+        .onChange(of: editor.mediaPanelPasteRequestTick) { _, _ in
+            handleClipboardPaste()
+        }
+        .onChange(of: currentFolderId, initial: true) { _, folderId in
+            editor.mediaPanelCurrentFolderId = folderId
+        }
+        .sheet(isPresented: $showMatteSheet) {
+            MatteSheet(isPresented: $showMatteSheet)
+        }
+    }
+
+    private var swapBanner: some View {
+        let tint = Color(nsColor: (editor.pendingSwapClip?.mediaType ?? .video).themeColor)
+        return HStack(spacing: AppTheme.Spacing.sm) {
+            Image(systemName: "arrow.left.arrow.right")
+                .font(.system(size: AppTheme.FontSize.smMd, weight: .semibold))
+                .foregroundStyle(tint)
+            Text(L10n.string("Pick a replacement for \"\(editor.pendingSwapClipName ?? "clip")\""))
+                .font(.system(size: AppTheme.FontSize.sm, weight: .medium))
+                .foregroundStyle(AppTheme.Text.primaryColor)
+                .lineLimit(1)
+                .truncationMode(.middle)
+            Spacer(minLength: AppTheme.Spacing.sm)
+            Button(L10n.string("Cancel")) { editor.cancelMediaSwap() }
+                .buttonStyle(.plain)
+                .font(.system(size: AppTheme.FontSize.xs, weight: .medium))
+                .foregroundStyle(AppTheme.Text.secondaryColor)
+        }
+        .padding(.horizontal, AppTheme.Spacing.mdLg)
+        .padding(.vertical, AppTheme.Spacing.sm)
+        .background(tint.opacity(AppTheme.Opacity.faint))
+        .overlay(alignment: .bottom) {
+            Rectangle()
+                .fill(tint.opacity(AppTheme.Opacity.muted))
+                .frame(height: AppTheme.BorderWidth.hairline)
+        }
+    }
+
+    private func toastBanner(_ toast: MediaPanelToast) -> some View {
+        HStack(spacing: AppTheme.Spacing.sm) {
+            switch toast.kind {
+            case .progress:
+                ProgressView()
+                    .controlSize(.small)
+            case .success:
+                Image(systemName: "checkmark.circle.fill")
+                    .font(.system(size: AppTheme.FontSize.smMd, weight: .semibold))
+                    .foregroundStyle(AppTheme.Status.successColor)
+            case .warning:
+                Image(systemName: "exclamationmark.triangle.fill")
+                    .font(.system(size: AppTheme.FontSize.smMd, weight: .semibold))
+                    .foregroundStyle(AppTheme.Accent.timecodeColor)
+            }
+            Text(toast.message)
+                .font(.system(size: AppTheme.FontSize.sm, weight: .medium))
+                .foregroundStyle(AppTheme.Text.primaryColor)
+                .lineLimit(2)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .padding(.horizontal, AppTheme.Spacing.mdLg)
+        .padding(.vertical, AppTheme.Spacing.smMd)
+        .background(
+            RoundedRectangle(cornerRadius: AppTheme.Radius.md)
+                .fill(AppTheme.Background.prominentColor)
+                .overlay(
+                    RoundedRectangle(cornerRadius: AppTheme.Radius.md)
+                        .strokeBorder(AppTheme.Border.primaryColor, lineWidth: AppTheme.BorderWidth.hairline)
+                )
+        )
+        .shadow(AppTheme.Shadow.lg)
+        .padding(.horizontal, AppTheme.Spacing.lgXl)
+        .padding(.bottom, AppTheme.Spacing.lgXl)
+        .onTapGesture {
+            guard toast.kind != .progress else { return }
+            editor.dismissMediaPanelToast()
+        }
+        .task(id: toast) {
+            guard toast.kind != .progress else { return }
+            try? await Task.sleep(for: .seconds(4))
+            guard !Task.isCancelled else { return }
+            editor.dismissMediaPanelToast()
+        }
+    }
+
+    /// If the current folder, rename target, or hover target has been deleted,
+    /// drop them back to safe defaults. Pops drilled-in views to root.
+    private func pruneStaleFolderState() {
+        if let id = currentFolderId, editor.folder(id: id) == nil { navigateToFolder(nil) }
+        if let id = renamingFolderId, editor.folder(id: id) == nil { renamingFolderId = nil }
+        if let id = dropTargetFolderId, editor.folder(id: id) == nil { dropTargetFolderId = nil }
+    }
+
+    private func revealAsset(id: String) {
+        guard let asset = editor.mediaAssets.first(where: { $0.id == id }) else { return }
+        if !passesFilters(asset) {
+            clearFilters()
+            editor.collapseMediaPanelSearch()
+        }
+        if viewMode == .folder, currentFolderId != asset.folderId {
+            currentFolderId = asset.folderId
+        }
+        // Auto-expand the asset's grouped section so the scroll target exists.
+        if viewMode == .grouped {
+            collapsedGroupedKeys.remove(asset.folderId ?? "")
+        }
+        editor.mediaPanelScrollTarget = id
+    }
+
+    func openFolder(id: String) {
+        guard editor.folder(id: id) != nil else { return }
+        if viewMode != .folder {
+            folderReturnViewMode = viewMode
+        }
+        currentFolderId = id
+        viewMode = .folder
+        editor.clearMediaPanelSelection()
+    }
+
+    // MARK: - Toolbar
+
+    private var toolbar: some View {
+        VStack(spacing: AppTheme.Spacing.sm) {
+            actionsRow
+            contextBar
+        }
+        .padding(.horizontal, AppTheme.Spacing.sm)
+        .padding(.bottom, AppTheme.Spacing.sm)
+        .background(AppTheme.Background.surfaceColor)
+        .animation(.easeInOut(duration: AppTheme.Anim.transition), value: editor.isMediaPanelSearchExpanded)
+    }
+
+    private var actionsRow: some View {
+        let showGenerate = !AccountService.shared.isMisconfigured
+        return HStack(spacing: AppTheme.Spacing.xs) {
+            if editor.isMediaPanelSearchExpanded {
+                ExpandablePanelSearch(
+                    text: $searchQuery,
+                    focus: $isSearchFocused
+                )
+                    .layoutPriority(1)
+            } else {
+                toolbarButton(title: L10n.string("Import"), action: importMedia)
+                    .tourAnchor(.importButton)
+                if showGenerate {
+                    toolbarButton(title: L10n.string("Generate"), prominent: true, action: toggleGenerationPanel)
+                        .tourAnchor(.generateButton)
+                }
+                overflowMenu
+                Spacer(minLength: AppTheme.Spacing.zero)
+            }
+
+            MediaSearchIndexStatus(search: editor.searchIndex, mediaAssets: editor.mediaAssets)
+                .tourAnchor(.smartSearch)
+
+            if !editor.isMediaPanelSearchExpanded {
+                ExpandablePanelSearch(
+                    text: $searchQuery,
+                    focus: $isSearchFocused
+                )
+            }
+
+            displayControls
+        }
+    }
+
+    // MARK: - Context bar (breadcrumb + count)
+
+    var breadcrumbItems: [BreadcrumbItem] {
+        var items: [BreadcrumbItem] = [BreadcrumbItem(folderId: nil, name: L10n.string("Library"))]
+        for f in editor.folderPath(for: currentFolderId) {
+            items.append(BreadcrumbItem(folderId: f.id, name: f.name))
+        }
+        return items
+    }
+
+    struct BreadcrumbItem: Identifiable {
+        let folderId: String?
+        let name: String
+        var id: String { folderId ?? "__root__" }
+    }
+
+    private var contextBar: some View {
+        HStack(spacing: AppTheme.Spacing.xs) {
+            contextPath
+                .layoutPriority(1)
+
+            Spacer(minLength: AppTheme.Spacing.xs)
+
+            itemCountText
+        }
+        .frame(height: AppTheme.MediaPanel.contextRowHeight)
+    }
+
+    @ViewBuilder
+    private var contextPath: some View {
+        if viewMode == .folder {
+            breadcrumbBar
+        } else {
+            Text(L10n.string(key: viewMode.title))
+                .font(.system(size: AppTheme.FontSize.xs, weight: AppTheme.FontWeight.semibold))
+                .foregroundStyle(AppTheme.Text.primaryColor)
+                .lineLimit(1)
+                .frame(maxWidth: .infinity, alignment: .leading)
+        }
+    }
+
+    private var breadcrumbBar: some View {
+        ScrollView(.horizontal) {
+            HStack(spacing: AppTheme.Spacing.xs) {
+                ForEach(Array(breadcrumbItems.enumerated()), id: \.element.id) { idx, item in
+                    if idx > 0 {
+                        Image(systemName: "chevron.right")
+                            .font(.system(size: AppTheme.FontSize.xxs))
+                            .foregroundStyle(AppTheme.Text.mutedColor)
+                    }
+                    breadcrumbChip(item: item, isLeaf: idx == breadcrumbItems.count - 1)
+                }
+            }
+        }
+        .scrollIndicators(.never)
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    @ViewBuilder
+    private var displayControls: some View {
+        toolbarMenuIcon(systemName: "rectangle.grid.2x2") {
+            Section(L10n.string("View")) {
+                ForEach(ViewMode.allCases, id: \.self) { mode in
+                    Button {
+                        setViewMode(mode)
+                    } label: {
+                        Label(L10n.string(key: mode.title), systemImage: viewMode == mode ? "checkmark" : mode.systemImage)
+                    }
+                }
+            }
+            Divider()
+            Section(L10n.string("Thumbnail Size")) {
+                ForEach(ThumbnailPreset.allCases) { preset in
+                    Button {
+                        thumbnailSize = preset.size
+                    } label: {
+                        Label(L10n.string(key: preset.title), systemImage: thumbnailSize == preset.size ? "checkmark" : "")
+                    }
+                }
+            }
+        }
+
+        toolbarMenuIcon(systemName: "arrow.up.arrow.down") {
+            ForEach(SortMode.allCases, id: \.self) { mode in
+                Button {
+                    sortMode = mode
+                } label: {
+                    Label(L10n.string(key: mode.title), systemImage: sortMode == mode ? "checkmark" : "")
+                }
+            }
+        }
+
+        toolbarMenuIcon(
+            systemName: "line.3.horizontal.decrease",
+            foregroundStyle: hasActiveFilters ? AppTheme.Accent.primary : AppTheme.Text.tertiaryColor
+        ) {
+            ForEach(Self.filterableTypes, id: \.self) { type in
+                Button { toggleFilter(type) } label: {
+                    Label(type.localizedTrackLabel, systemImage: filterTypes.contains(type) ? "checkmark" : "")
+                }
+            }
+            Divider()
+            Button { filterAI.toggle() } label: {
+                Label(L10n.string("AI Generated"), systemImage: filterAI ? "checkmark" : "")
+            }
+            Divider()
+            Button(L10n.string("Clear Filters"), action: clearFilters)
+        }
+    }
+
+    private func breadcrumbChip(item: BreadcrumbItem, isLeaf: Bool) -> some View {
+        let textColor = isLeaf ? AppTheme.Text.primaryColor : AppTheme.Text.tertiaryColor
+        return Button {
+            if !isLeaf { navigateToFolder(item.folderId) }
+        } label: {
+            Text(item.name)
+                .font(.system(size: AppTheme.FontSize.xs, weight: isLeaf ? .semibold : .regular))
+                .foregroundStyle(textColor)
+                .lineLimit(1)
+                .padding(.horizontal, AppTheme.Spacing.sm)
+                .padding(.vertical, AppTheme.Spacing.xxs)
+                .hoverHighlight(cornerRadius: AppTheme.Radius.xsSm)
+        }
+        .buttonStyle(.plain)
+        .focusable(false)
+        .onDrop(of: [.fileURL, .text], isTargeted: nil) { providers in
+            handleProviderDrop(providers, into: item.folderId)
+            return true
+        }
+    }
+
+    // MARK: - Selection / state derivations
+
+    var selectedMediaAssetsInOrder: [MediaAsset] {
+        editor.mediaAssets.filter { editor.selectedMediaAssetIds.contains($0.id) }
+    }
+
+    private var showsEmptyState: Bool {
+        editor.mediaAssets.isEmpty && editor.folders.isEmpty
+    }
+
+    // MARK: - Sort & Filter
+
+    enum SortMode: CaseIterable {
+        case name, dateAdded, duration, type
+
+        var title: String {
+            switch self {
+            case .name: L10n.key("Name")
+            case .dateAdded: L10n.key("Date Added")
+            case .duration: L10n.key("Duration")
+            case .type: L10n.key("Type")
+            }
+        }
+    }
+
+    private var hasActiveFilters: Bool {
+        !filterTypes.isEmpty || filterAI
+    }
+
+    private func toggleFilter(_ type: ClipType) {
+        if filterTypes.contains(type) {
+            filterTypes.remove(type)
+        } else {
+            filterTypes.insert(type)
+        }
+    }
+
+    private func clearFilters() {
+        filterTypes.removeAll()
+        filterAI = false
+    }
+
+    var assetsInCurrentFolder: [MediaAsset] {
+        sortAndFilter(editor.assetsIn(folderId: currentFolderId))
+    }
+
+    var subfoldersInCurrentFolder: [MediaFolder] {
+        let folders = editor.subfolders(of: currentFolderId)
+        let q = searchQuery.trimmingCharacters(in: .whitespaces)
+        guard !q.isEmpty else { return folders }
+        return folders.filter { $0.name.localizedCaseInsensitiveContains(q) }
+    }
+
+    var timelinesInCurrentFolder: [Timeline] {
+        filteredTimelines(in: currentFolderId)
+    }
+
+    func filteredTimelines(in folderId: String?) -> [Timeline] {
+        searchFilteredTimelines(editor.timelines.filter { $0.folderId == folderId })
+    }
+
+    func searchFilteredTimelines(_ timelines: [Timeline]) -> [Timeline] {
+        Self.timelinesMatchingName(timelines, query: searchQuery)
+    }
+
+    static func timelinesMatchingName(_ timelines: [Timeline], query: String) -> [Timeline] {
+        let q = query.trimmingCharacters(in: .whitespaces)
+        guard !q.isEmpty else { return timelines }
+        return timelines.filter { $0.name.localizedCaseInsensitiveContains(q) }
+    }
+
+    private func passesFilters(_ asset: MediaAsset) -> Bool {
+        let typeOk = filterTypes.isEmpty || filterTypes.contains(asset.type)
+        let aiOk = !filterAI || asset.isGenerated
+        let q = searchQuery.trimmingCharacters(in: .whitespaces)
+        let nameOk = q.isEmpty || asset.name.localizedCaseInsensitiveContains(q)
+        return typeOk && aiOk && nameOk
+    }
+
+    func sortAndFilter(_ assets: [MediaAsset]) -> [MediaAsset] {
+        let filtered = assets.filter(passesFilters)
+        return switch sortMode {
+        case .dateAdded: filtered
+        case .name: filtered.sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+        case .duration: filtered.sorted { $0.duration > $1.duration }
+        case .type: filtered.sorted { $0.type.rawValue < $1.type.rawValue }
+        }
+    }
+
+    private var currentFolderItemCount: Int {
+        subfoldersInCurrentFolder.count + timelinesInCurrentFolder.count + assetsInCurrentFolder.count
+    }
+
+    // MARK: - Toolbar helpers
+
+    private var itemCountText: some View {
+        Text(currentFolderItemCount == 1
+            ? L10n.string("1 item")
+            : L10n.string("\(currentFolderItemCount) items"))
+            .font(.system(size: AppTheme.FontSize.xs))
+            .foregroundStyle(AppTheme.Text.mutedColor)
+            .monospacedDigit()
+            .lineLimit(1)
+            .fixedSize()
+    }
+
+    private func toolbarButton(
+        title: String,
+        prominent: Bool = false,
+        action: @escaping () -> Void
+    ) -> some View {
+        Button(action: action) {
+            Text(title)
+        }
+        .buttonStyle(.capsule(prominent ? .prominent : .secondary))
+        .fixedSize(horizontal: true, vertical: false)
+        .focusable(false)
+        .help(title)
+    }
+
+    private var mediaAreaCollapsed: Bool {
+        !editor.mediaPanelVisible
+            || (editor.maximizedPanel != nil && editor.maximizedPanel != .media)
+    }
+
+    private var generationPanelMaxHeight: Double {
+        Double(max(0, mediaPanelHeight - AppTheme.GenerationPanel.mediaAreaMinHeight))
+    }
+
+    private func toggleGenerationPanel() {
+        withAnimation(.easeInOut(duration: AppTheme.Anim.transition)) {
+            editor.showGenerationPanel.toggle()
+        }
+    }
+
+    private var overflowMenu: some View {
+        let canOrganize = !AccountService.shared.isMisconfigured && !editor.mediaAssets.isEmpty
+        return toolbarMenuIcon(systemName: "ellipsis") {
+            Button(action: createNewFolderInCurrent) {
+                Label(L10n.string("New Folder"), systemImage: "folder.badge.plus")
+            }
+            Button { showMatteSheet = true } label: {
+                Label(L10n.string("Create Matte"), systemImage: "square.fill")
+            }
+            if canOrganize {
+                Button(action: organizeWithAgent) {
+                    Label(L10n.string("Organize with Agent"), systemImage: "wand.and.stars")
+                }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var mediaBrowserContextMenu: some View {
+        Button(action: createNewFolderInCurrent) {
+            Label(L10n.string("New Folder"), systemImage: "folder.badge.plus")
+        }
+        Button(action: importMedia) {
+            Label(L10n.string("Import Media…"), systemImage: "square.and.arrow.down")
+        }
+    }
+
+    private func organizeWithAgent() {
+        let folderHint = currentFolderId.map { _ in " Work within the current folder." } ?? ""
+        let service = editor.agentService
+        service.newChat()
+        service.draft = "Organize my media library. Review the assets, group related ones into clearly named folders, and give generically-named assets short descriptive names — inspect an asset when its name is unclear. Don't delete anything or change the timeline.\(folderHint)"
+        editor.agentPanelVisible = true
+    }
+
+    private func toolbarMenuIcon<Content: View>(
+        systemName: String,
+        foregroundStyle: some ShapeStyle = AppTheme.Text.tertiaryColor,
+        @ViewBuilder content: () -> Content
+    ) -> some View {
+        Menu(content: content) {
+            Image(systemName: systemName)
+                .font(.system(size: AppTheme.FontSize.xs))
+                .foregroundStyle(foregroundStyle)
+                .frame(width: AppTheme.IconSize.sm, height: AppTheme.IconSize.sm)
+        }
+        .menuStyle(.borderlessButton)
+        .menuIndicator(.hidden)
+        .fixedSize()
+        .focusable(false)
+        .hoverHighlight()
+    }
+
+    // MARK: - Folder commands
+
+    private func createNewFolderInCurrent() {
+        editor.collapseMediaPanelSearch()
+        setViewMode(.folder)
+        renamingTimelineId = nil
+        let id = editor.createMediaPanelFolder(in: currentFolderId)
+        renamingFolderId = id
+    }
+
+    private func navigateUp() {
+        guard let id = currentFolderId, let folder = editor.folder(id: id) else { return }
+        navigateToFolder(folder.parentFolderId)
+    }
+
+    func setViewMode(_ mode: ViewMode) {
+        viewMode = mode
+        folderReturnViewMode = nil
+    }
+
+    func navigateToFolder(_ folderId: String?) {
+        currentFolderId = folderId
+        if folderId == nil, let returnMode = folderReturnViewMode {
+            viewMode = returnMode
+            folderReturnViewMode = nil
+        }
+    }
+
+    // MARK: - Marquee Selection
+
+    var marqueeGesture: some Gesture {
+        DragGesture(minimumDistance: 3, coordinateSpace: .named("mediaGrid"))
+            .onChanged { value in
+                if !marqueeSelection.isActive {
+                    let startOnCell = assetFrames.values.contains { $0.contains(value.startLocation) }
+                    if startOnCell { return }
+                    let extending = NSEvent.modifierFlags.contains(.shift)
+                    if !extending { editor.clearMediaPanelSelection() }
+                    marqueeSelection.begin(
+                        baseAssets: extending ? editor.selectedMediaAssetIds : [],
+                        baseFolders: extending ? editor.selectedFolderIds : [],
+                        baseTimelines: extending ? editor.selectedTimelineIds : []
+                    )
+                }
+
+                let rect = marqueeRect(from: value)
+                marqueeSelection.rect = rect
+                var assetIds = marqueeSelection.baseAssets
+                var folderIds = marqueeSelection.baseFolders
+                var timelineIds = marqueeSelection.baseTimelines
+
+                // Frame keys are raw asset ids, "folder-<id>", or "timeline-<id>".
+                for (id, frame) in assetFrames where rect.intersects(frame) {
+                    if let folderId = MediaCell.folderId(fromFrameKey: id) {
+                        folderIds.insert(folderId)
+                    } else if let timelineId = MediaPanelItemKey.timelineId(from: id) {
+                        timelineIds.insert(timelineId)
+                    } else {
+                        assetIds.insert(id)
+                    }
+                }
+
+                if assetIds != editor.selectedMediaAssetIds {
+                    editor.selectedMediaAssetIds = assetIds
+                }
+                if folderIds != editor.selectedFolderIds {
+                    editor.selectedFolderIds = folderIds
+                }
+                if timelineIds != editor.selectedTimelineIds {
+                    editor.selectedTimelineIds = timelineIds
+                }
+            }
+            .onEnded { _ in
+                editor.pruneMediaPanelSelectionAnchor()
+                marqueeSelection.reset()
+            }
+    }
+
+    @ViewBuilder
+    var marqueeOverlay: some View {
+        if let rect = marqueeSelection.rect {
+            Rectangle()
+                .stroke(AppTheme.Interaction.fill(AppTheme.Opacity.strong), style: StrokeStyle(lineWidth: AppTheme.BorderWidth.thin, dash: [3, 3]))
+                .background(Rectangle().fill(AppTheme.Interaction.fill(AppTheme.Opacity.soft)))
+                .frame(width: rect.width, height: rect.height)
+                .position(x: rect.midX, y: rect.midY)
+                .allowsHitTesting(false)
+        }
+    }
+
+    private func marqueeRect(from value: DragGesture.Value) -> CGRect {
+        CGRect(
+            x: min(value.startLocation.x, value.location.x),
+            y: min(value.startLocation.y, value.location.y),
+            width: abs(value.location.x - value.startLocation.x),
+            height: abs(value.location.y - value.startLocation.y)
+        )
+    }
+
+    // MARK: - Empty state + drop highlight
+
+    private var emptyStateView: some View {
+        VStack(spacing: AppTheme.Spacing.lg) {
+            Spacer()
+
+            Image(systemName: "photo.on.rectangle.angled")
+                .font(.system(size: AppTheme.FontSize.display, weight: .light))
+                .foregroundStyle(AppTheme.Text.tertiaryColor)
+
+            VStack(spacing: AppTheme.Spacing.xs) {
+                Text(L10n.string("No media yet"))
+                    .font(.system(size: AppTheme.FontSize.title1, weight: .light))
+                    .tracking(AppTheme.Tracking.tight)
+                    .foregroundStyle(AppTheme.Text.primaryColor)
+
+                Text(L10n.string("Drop files here or import from disk"))
+                    .font(.system(size: AppTheme.FontSize.sm))
+                    .foregroundStyle(AppTheme.Text.tertiaryColor)
+            }
+
+            Spacer()
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+
+    private var dropHighlight: some View {
+        RoundedRectangle(cornerRadius: AppTheme.Radius.md)
+            .strokeBorder(
+                AppTheme.Accent.primary.opacity(0.6),
+                style: StrokeStyle(lineWidth: AppTheme.BorderWidth.thick, dash: [8, 4])
+            )
+            .background(
+                RoundedRectangle(cornerRadius: AppTheme.Radius.md)
+                    .fill(AppTheme.Accent.primary.opacity(AppTheme.Opacity.subtle))
+            )
+            .padding(AppTheme.Spacing.xs)
+    }
+
+    // MARK: - Import
+
+    private func importMedia() {
+        let panel = NSOpenPanel()
+        panel.allowsMultipleSelection = true
+        panel.canChooseDirectories = true
+        panel.message = L10n.string("Select media files or folders to import")
+        var types: [UTType] = [.movie, .image, .audio, .json]
+        if let lottie = UTType(filenameExtension: "lottie") { types.append(lottie) }
+        types.append(contentsOf: SubtitleFileParser.contentTypes)
+        panel.allowedContentTypes = types
+        panel.begin { response in
+            guard response == .OK else { return }
+            let urls = panel.urls
+            let folderId = currentFolderId
+            Task { @MainActor in
+                await Self.handlePanelFinderDrop(urls: urls, into: folderId, editor: editor)
+            }
+        }
+    }
+}
+
+// MARK: - Marquee state
+
+struct MarqueeSelection {
+    var rect: CGRect?
+    var isActive = false
+    var baseAssets: Set<String> = []
+    var baseFolders: Set<String> = []
+    var baseTimelines: Set<String> = []
+
+    mutating func begin(baseAssets: Set<String>, baseFolders: Set<String>, baseTimelines: Set<String>) {
+        isActive = true
+        self.baseAssets = baseAssets
+        self.baseFolders = baseFolders
+        self.baseTimelines = baseTimelines
+    }
+
+    mutating func reset() {
+        rect = nil
+        isActive = false
+        baseAssets = []
+        baseFolders = []
+        baseTimelines = []
+    }
+}

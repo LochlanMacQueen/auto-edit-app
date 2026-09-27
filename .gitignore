@@ -1,0 +1,6 @@
+.build/
+vendor-src/
+.env
+.env.*
+*.dSYM
+.DS_Store
