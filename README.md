@@ -1,5 +1,7 @@
 # auto-edit (app)
 
+**Download:** [lochlanmacqueen.github.io/auto-edit](https://lochlanmacqueen.github.io/auto-edit/) · [latest DMG](https://github.com/LochlanMacQueen/auto-edit-app/releases/latest/download/auto-edit.dmg)
+
 **One install:** a native macOS app that is the video editor *and* the auto-edit server. Your
 agent (Claude Desktop / Claude Code / ChatGPT) connects to one MCP endpoint and can transcribe
 takes, cut dead space, build the timeline, export with music, park the result in **Review**,
